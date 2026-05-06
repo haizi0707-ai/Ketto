@@ -234,6 +234,200 @@ def format_condition_lines(df: pd.DataFrame, max_rows: int = 12) -> list[str]:
     return lines
 
 
+
+# =========================
+# 血統CSV判定機能
+# =========================
+EVAL_POINT = {"S": 100, "A": 85, "B": 70, "C": 50, "D": 25, "": 0}
+MARK_POINT = {"◎": 100, "○": 80, "〇": 80, "△": 55, "×": 20, "": 0}
+BLOOD_WEIGHTS = {
+    "父系統": 0.35,
+    "母父系統": 0.25,
+    "父": 0.25,
+    "母父": 0.15,
+}
+
+COLUMN_ALIASES = {
+    "馬番": ["馬番", "horseNo", "horse_number"],
+    "枠番": ["枠番", "枠", "frame", "gate"],
+    "馬名": ["馬名", "馬名S", "horseName", "horse_name"],
+    "父": ["父", "父馬", "種牡馬", "sire"],
+    "母父": ["母父", "母父馬", "bms", "broodmare_sire"],
+    "父系統": ["父系統", "父系", "sire_line"],
+    "母父系統": ["母父系統", "母父系", "bms_line"],
+    "父系統適性": ["父系統適性"],
+    "母父系統適性": ["母父系統適性"],
+    "父適性": ["父適性"],
+    "母父適性": ["母父適性"],
+}
+
+def normalize_columns_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    norm_cols = {c: norm_text(c) for c in out.columns}
+    for target, aliases in COLUMN_ALIASES.items():
+        if target in out.columns:
+            continue
+        found = None
+        for a in aliases:
+            for c, nc in norm_cols.items():
+                if nc == a:
+                    found = c
+                    break
+            if found:
+                break
+        if found:
+            out = out.rename(columns={found: target})
+    for c in ["馬番", "枠番", "馬名", "父", "母父", "父系統", "母父系統"]:
+        if c not in out.columns:
+            out[c] = ""
+    return out
+
+
+def parse_pasted_csv(text: str) -> pd.DataFrame:
+    text = text.strip()
+    if not text:
+        return pd.DataFrame()
+    return pd.read_csv(io.StringIO(text))
+
+
+def make_lookup(df: pd.DataFrame) -> dict:
+    if df is None or df.empty or "血統名" not in df.columns:
+        return {}
+    lookup = {}
+    for _, r in df.iterrows():
+        name = norm_text(r.get("血統名", ""))
+        if not name:
+            continue
+        ev = norm_text(r.get("評価", ""))
+        lift = r.get("リフト", "")
+        pr = r.get("複勝率", "")
+        n = r.get("母数", "")
+        comment = norm_text(r.get("特徴コメント", ""))
+        if name not in lookup:
+            lookup[name] = {"評価": ev, "点": EVAL_POINT.get(ev, 0), "リフト": lift, "複勝率": pr, "母数": n, "コメント": comment}
+    return lookup
+
+
+def mark_to_point(v) -> int:
+    s = norm_text(v)
+    if s in MARK_POINT:
+        return MARK_POINT[s]
+    if "◎" in s:
+        return 100
+    if "○" in s or "〇" in s:
+        return 80
+    if "△" in s:
+        return 55
+    if "×" in s:
+        return 20
+    if s in EVAL_POINT:
+        return EVAL_POINT[s]
+    return 0
+
+
+def point_to_mark(pt: float) -> str:
+    if pt >= 90:
+        return "◎"
+    if pt >= 70:
+        return "○"
+    if pt >= 45:
+        return "△"
+    if pt > 0:
+        return "×"
+    return "×"
+
+
+def score_to_rank(score: float) -> str:
+    if score >= 85:
+        return "S"
+    if score >= 70:
+        return "A"
+    if score >= 55:
+        return "B"
+    if score >= 40:
+        return "C"
+    return "D"
+
+
+def eval_one_value(name: str, lookup: dict, fallback_mark="") -> tuple[float, str, str]:
+    key = norm_text(name)
+    if key and key in lookup:
+        d = lookup[key]
+        ev = d.get("評価", "")
+        pt = float(d.get("点", 0) or 0)
+        detail = f"評価{ev} 母数{d.get('母数','')} リフト{d.get('リフト','')}"
+        return pt, point_to_mark(pt), detail
+    # LLMが作ったCSVの適性列があれば補助利用
+    pt = float(mark_to_point(fallback_mark))
+    return pt, point_to_mark(pt), "該当統計なし" if pt == 0 else "入力CSV判定を利用"
+
+
+def judge_bloodline_csv(pred_df: pd.DataFrame, sire_line_df: pd.DataFrame, bms_line_df: pd.DataFrame, sire_df: pd.DataFrame, bms_df: pd.DataFrame) -> pd.DataFrame:
+    if pred_df is None or pred_df.empty:
+        return pd.DataFrame()
+    df = normalize_columns_for_prediction(pred_df)
+    sl_lookup = make_lookup(sire_line_df)
+    bl_lookup = make_lookup(bms_line_df)
+    sire_lookup = make_lookup(sire_df)
+    bms_lookup = make_lookup(bms_df)
+
+    rows = []
+    for _, r in df.iterrows():
+        frame_zone = norm_text(r.get("枠ゾーン", ""))
+        if not frame_zone:
+            frame_zone = frame_zone_from_gate(r.get("枠番", ""))
+
+        sl_pt, sl_mark, sl_detail = eval_one_value(r.get("父系統", ""), sl_lookup, r.get("父系統適性", ""))
+        bl_pt, bl_mark, bl_detail = eval_one_value(r.get("母父系統", ""), bl_lookup, r.get("母父系統適性", ""))
+        sire_pt, sire_mark, sire_detail = eval_one_value(r.get("父", ""), sire_lookup, r.get("父適性", ""))
+        bms_pt, bms_mark, bms_detail = eval_one_value(r.get("母父", ""), bms_lookup, r.get("母父適性", ""))
+
+        total = (
+            sl_pt * BLOOD_WEIGHTS["父系統"]
+            + bl_pt * BLOOD_WEIGHTS["母父系統"]
+            + sire_pt * BLOOD_WEIGHTS["父"]
+            + bms_pt * BLOOD_WEIGHTS["母父"]
+        )
+        rank = score_to_rank(total)
+        hit_parts = []
+        if sl_pt >= 70: hit_parts.append(f"父系統{norm_text(r.get('父系統',''))}")
+        if bl_pt >= 70: hit_parts.append(f"母父系統{norm_text(r.get('母父系統',''))}")
+        if sire_pt >= 70: hit_parts.append(f"父{norm_text(r.get('父',''))}")
+        if bms_pt >= 70: hit_parts.append(f"母父{norm_text(r.get('母父',''))}")
+        comment = "・".join(hit_parts) if hit_parts else "今回条件では強調材料少なめ"
+
+        rows.append({
+            "馬番": r.get("馬番", ""),
+            "枠番": r.get("枠番", ""),
+            "馬名": r.get("馬名", ""),
+            "父": r.get("父", ""),
+            "母父": r.get("母父", ""),
+            "父系統": r.get("父系統", ""),
+            "母父系統": r.get("母父系統", ""),
+            "枠ゾーン": frame_zone,
+            "父系統適性": sl_mark,
+            "母父系統適性": bl_mark,
+            "父適性": sire_mark,
+            "母父適性": bms_mark,
+            "父系統点": round(sl_pt, 1),
+            "母父系統点": round(bl_pt, 1),
+            "父点": round(sire_pt, 1),
+            "母父点": round(bms_pt, 1),
+            "総合血統点": round(total, 1),
+            "総合血統評価": rank,
+            "補足": comment,
+            "父系統根拠": sl_detail,
+            "母父系統根拠": bl_detail,
+            "父根拠": sire_detail,
+            "母父根拠": bms_detail,
+        })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["馬番_sort"] = pd.to_numeric(out["馬番"], errors="coerce").fillna(999)
+        out = out.sort_values(["総合血統点", "馬番_sort"], ascending=[False, True]).drop(columns=["馬番_sort"]).reset_index(drop=True)
+        out.insert(0, "血統順位", range(1, len(out) + 1))
+    return out
+
 def build_prompt(target_label: str, year: str, area_type: str, racecourse: str, course_type: str,
                  surface: str, distance_value: str, band: str, ground: str, frame_mode: str,
                  sire_line_df: pd.DataFrame, bms_line_df: pd.DataFrame, sire_df: pd.DataFrame, bms_df: pd.DataFrame) -> str:
@@ -358,7 +552,7 @@ def build_app():
     st.markdown("### 選択条件")
     st.write(f"**{area_type} / {racecourse}** → 中央換算：**{course_type}**｜{surface}{distance_value}m｜{band}｜馬場：{ground}｜枠：{frame_mode}")
 
-    tab1, tab2, tab3 = st.tabs(["①強い血統確認", "②プロンプト作成", "③データ確認"])
+    tab1, tab2, tab3, tab4 = st.tabs(["①強い血統確認", "②プロンプト作成", "③データ確認", "④血統CSV判定"])
 
     show_cols = ["場所", "コースタイプ", "芝・ダ", "距離帯", "馬場分類", "枠ゾーン", "血統区分", "血統名", "母数", "勝率", "複勝率", "単勝回収率", "複勝回収率", "基準複勝率", "複勝率差", "リフト", "評価", "特徴コメント"]
 
@@ -397,6 +591,63 @@ def build_app():
             st.dataframe(top_filtered[[c for c in show_cols if c in top_filtered.columns]], use_container_width=True, hide_index=True)
             csv = top_filtered.to_csv(index=False, encoding="utf-8-sig")
             st.download_button("この条件のTOP血統CSVをダウンロード", data=csv.encode("utf-8-sig"), file_name="selected_bloodline_top.csv", mime="text/csv")
+
+
+    with tab4:
+        st.subheader("血統CSV貼り付け・判定")
+        st.caption("②のプロンプトで作成したCSV、または馬番・枠番・馬名・父・母父・父系統・母父系統を含むCSVを貼り付けると、現在選択中の条件で血統適性を再判定します。")
+        up_pred = st.file_uploader("血統CSVアップロード", type=["csv"], key="bloodline_pred_csv")
+        pasted_pred = st.text_area(
+            "または血統CSVを直接貼り付け",
+            height=220,
+            placeholder="対象区分,競馬場,年,距離,芝ダ,想定馬場,馬番,枠番,馬名,父,母父,父系統,母父系統,..."
+        )
+        pred_df = pd.DataFrame()
+        if up_pred is not None:
+            raw = up_pred.getvalue()
+            for enc in ["utf-8-sig", "cp932", "utf-8"]:
+                try:
+                    pred_df = pd.read_csv(io.BytesIO(raw), encoding=enc)
+                    break
+                except Exception:
+                    pass
+        elif pasted_pred.strip():
+            try:
+                pred_df = parse_pasted_csv(pasted_pred)
+            except Exception as e:
+                st.error(f"CSVを読み込めませんでした: {e}")
+
+        if pred_df.empty:
+            st.info("ここにCSVを貼り付けると、血統適性ランキングとCSV出力が表示されます。")
+        else:
+            judged = judge_bloodline_csv(pred_df, sire_line_df, bms_line_df, sire_df, bms_df)
+            if judged.empty:
+                st.error("判定できませんでした。馬名・父・母父・父系統・母父系統の列名を確認してください。")
+            else:
+                st.markdown("### 判定結果")
+                view_cols = [
+                    "血統順位", "馬番", "枠番", "馬名", "父", "母父", "父系統", "母父系統", "枠ゾーン",
+                    "父系統適性", "母父系統適性", "父適性", "母父適性", "総合血統点", "総合血統評価", "補足"
+                ]
+                st.dataframe(judged[[c for c in view_cols if c in judged.columns]], use_container_width=True, hide_index=True)
+
+                top = judged.iloc[0]
+                st.success(f"血統適性トップ：{top.get('馬番','')} {top.get('馬名','')} / 評価{top.get('総合血統評価','')} / {top.get('総合血統点','')}点")
+
+                detail_cols = [
+                    "血統順位", "馬番", "枠番", "馬名", "父", "母父", "父系統", "母父系統", "枠ゾーン",
+                    "父系統適性", "母父系統適性", "父適性", "母父適性", "父系統点", "母父系統点", "父点", "母父点",
+                    "総合血統点", "総合血統評価", "補足", "父系統根拠", "母父系統根拠", "父根拠", "母父根拠"
+                ]
+                export_df = judged[[c for c in detail_cols if c in judged.columns]].copy()
+                csv = export_df.to_csv(index=False, encoding="utf-8-sig")
+                st.download_button(
+                    "血統適性判定CSVをダウンロード",
+                    data=csv.encode("utf-8-sig"),
+                    file_name="bloodline_judgement_result.csv",
+                    mime="text/csv",
+                )
+                st.caption("判定は現在選択中の競馬場タイプ・芝ダ・距離帯・馬場・枠条件に対する中央15年データの血統成績を参照しています。")
 
 
 if __name__ == "__main__":
