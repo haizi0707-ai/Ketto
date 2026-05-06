@@ -26,6 +26,50 @@ CSV_FILES = {
     "bms": "競馬場_母父_枠馬場成績.csv",
 }
 
+def normalize_filename(name: str) -> str:
+    return unicodedata.normalize("NFKC", str(name)).replace(" ", "").replace("　", "").lower()
+
+def find_csv_fuzzy(key: str) -> Path | None:
+    """iPhone/GitHubアップロード時のファイル名ゆれ対策。完全一致しなくても探す。"""
+    candidates = sorted(BASE_DIR.glob("*.csv"))
+    if not candidates:
+        return None
+
+    wanted = normalize_filename(CSV_FILES.get(key, ""))
+    for p in candidates:
+        if normalize_filename(p.name) == wanted:
+            return p
+
+    rules = {
+        "top": ["分類別", "top", "条件", "抜粋"],
+        "summary": ["分類別", "強い", "系統", "サマリー"],
+        "course_summary": ["コースタイプ", "強い", "血統", "まとめ"],
+        "map": ["中央競馬場", "地方", "変換", "マップ"],
+        "sire_line": ["父系統", "枠馬場", "成績"],
+        "bms_line": ["母父系統", "枠馬場", "成績"],
+        "sire": ["競馬場", "父", "枠馬場", "成績"],
+        "bms": ["競馬場", "母父", "枠馬場", "成績"],
+    }
+    words = [normalize_filename(w) for w in rules.get(key, [])]
+    scored = []
+    for p in candidates:
+        n = normalize_filename(p.name)
+        # 父と父系統、母父と母父系統の取り違えを防ぐ
+        if key == "sire" and "父系統" in n:
+            continue
+        if key == "bms" and "母父系統" in n:
+            continue
+        if key == "sire_line" and "父系統" not in n:
+            continue
+        if key == "bms_line" and "母父系統" not in n:
+            continue
+        score = sum(1 for w in words if w in n)
+        if score:
+            scored.append((score, p))
+    if scored:
+        return sorted(scored, key=lambda x: x[0], reverse=True)[0][1]
+    return None
+
 CENTRAL_TRACK_TYPES = {
     "東京": "直線長め・持続型",
     "中京": "直線長め・持続型",
@@ -98,9 +142,12 @@ def read_csv_auto(path: Path) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_data():
     data = {}
+    paths = {}
     for key, fname in CSV_FILES.items():
-        data[key] = read_csv_auto(BASE_DIR / fname)
-    return data
+        path = find_csv_fuzzy(key) or (BASE_DIR / fname)
+        paths[key] = path
+        data[key] = read_csv_auto(path)
+    return data, paths
 
 
 def norm_text(v) -> str:
@@ -250,14 +297,16 @@ def build_prompt(target_label: str, year: str, area_type: str, racecourse: str, 
 
 
 def build_app():
-    data = load_data()
+    data, loaded_paths = load_data()
     st.title(APP_TITLE)
     st.caption("中央15年分の血統×競馬場×距離帯×馬場×枠データをもとに、地方・海外へ横展開するためのプロンプトを作成します。")
 
-    missing = [fname for fname in CSV_FILES.values() if not (BASE_DIR / fname).exists()]
-    if missing:
-        st.error("必要CSVが見つかりません。GitHub上でapp.pyと同じ階層にCSVを置いてください。")
-        st.write(missing)
+    missing_keys = [key for key, df in data.items() if df is None or df.empty]
+    if missing_keys:
+        st.error("必要CSVが読み込めません。GitHub上でapp.pyと同じ階層にCSVを置いてください。")
+        st.write("読み込みに失敗した項目:", {k: CSV_FILES.get(k, k) for k in missing_keys})
+        st.write("現在認識しているCSV:", [p.name for p in BASE_DIR.glob("*.csv")])
+        st.write("自動選択したファイル:", {k: (v.name if v else "未検出") for k, v in loaded_paths.items()})
         st.stop()
 
     with st.sidebar:
